@@ -20,6 +20,7 @@ from acp.schema import (
     Implementation, InitializeResponse, ListSessionsResponse, LoadSessionResponse, McpServerHttp, McpServerSse,
     McpServerStdio, ModelInfo, NewSessionResponse, PromptCapabilities, PromptResponse, ResumeSessionResponse,
     SessionCapabilities, SessionForkCapabilities, SessionInfo, SessionInfoUpdate, SessionListCapabilities,
+    SessionConfigOptionSelect, SessionConfigSelectOption,
     SessionMode, SessionModeState, SessionModelState, SessionResumeCapabilities, SetSessionConfigOptionResponse,
     SetSessionModeResponse, SetSessionModelResponse, TextContentBlock, Usage, UsageUpdate, UserMessageChunk,
 )
@@ -234,6 +235,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     """ACP Agent implementation wrapping Hermes AIAgent."""
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
+    # Local patch (hermes #105651): per-session reasoning effort as an ACP ``thought_level`` select,
+    # which Paseo/Zed render as a thinking picker. "default" = config.yaml's resolved setting.
+    _REASONING_CONFIG_ID = "reasoning_effort"
+    _REASONING_LEVELS = ("default", "none", "low", "medium", "high", "xhigh")
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
     _MODE_DEFAULT = "default"
     # mode id -> (edit approval policy, display name, description)
@@ -289,6 +294,35 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             current_mode_id=current,
             available_modes=[SessionMode(id=m, name=n, description=d) for m, (_p, n, d) in self._MODES.items()],
         )
+
+    def _reasoning_config_options(self, state: SessionState) -> list:
+        current = str((getattr(state, "config_options", None) or {}).get(self._REASONING_CONFIG_ID) or "default")
+        if current not in self._REASONING_LEVELS:
+            current = "default"
+        return [SessionConfigOptionSelect(
+            id=self._REASONING_CONFIG_ID, name="Reasoning effort", category="thought_level", type="select",
+            current_value=current,
+            options=[SessionConfigSelectOption(value=v, name=v.capitalize() if v != "xhigh" else "XHigh")
+                     for v in self._REASONING_LEVELS],
+        )]
+
+    def _apply_reasoning_effort(self, state: SessionState) -> None:
+        """Push the session's chosen effort onto the live agent ("default" re-resolves config.yaml)."""
+        from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+        agent = getattr(state, "agent", None)
+        level = (getattr(state, "config_options", None) or {}).get(self._REASONING_CONFIG_ID)
+        if agent is None or not level:
+            return
+        if level == "default":
+            try:
+                from hermes_cli.config import load_config
+                parsed = resolve_reasoning_config(load_config(), str(getattr(agent, "model", "") or ""))
+            except Exception:
+                logger.debug("Could not resolve default reasoning config", exc_info=True)
+                return
+        else:
+            parsed = parse_reasoning_effort(level)
+        agent.reasoning_config = parsed
 
     def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
         mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
@@ -605,6 +639,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return {
             "models": self._build_model_state(state),
             "modes": self._session_modes(state),
+            "config_options": self._reasoning_config_options(state),
             "field_meta": self._provenance_meta(state.session_id, getattr(state.agent, "session_id", state.session_id)),
         }
 
@@ -938,6 +973,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 logger.debug("Could not create ACP edit approval requester", exc_info=True)
 
         agent = state.agent
+        self._apply_reasoning_effort(state)
         agent.tool_progress_callback = cbs.tool_progress_cb
         # Thought panes get provider reasoning only — no local status updates, no fake accordion.
         agent.thinking_callback = None
@@ -1052,6 +1088,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             # mid-switch would otherwise run a whole turn before the client sees the
             # (possibly failed) switch result.
             self._schedule_soon(lambda: self._drain_queued_prompts(state, session_id, self._conn))
+        self._apply_reasoning_effort(state)
         logger.info(
             "Session %s: model switched to %s via provider %s", session_id, resolved_model, requested_provider
         )
@@ -1082,6 +1119,15 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         if str(config_id) == self._EDIT_APPROVAL_POLICY_CONFIG_ID:
             state.mode = self._EDIT_APPROVAL_POLICY_TO_MODE.get(str(value), self._MODE_DEFAULT)
+        elif str(config_id) == self._REASONING_CONFIG_ID:
+            if str(value) not in self._REASONING_LEVELS:
+                from acp.exceptions import RequestError
+                raise RequestError.invalid_params({"details": f"unknown reasoning effort {value!r}"})
+            options = getattr(state, "config_options", None)
+            options = options if isinstance(options, dict) else {}
+            options[self._REASONING_CONFIG_ID] = str(value)
+            state.config_options = options
+            self._apply_reasoning_effort(state)
         else:
             options = getattr(state, "config_options", None)
             if not isinstance(options, dict):
@@ -1090,4 +1136,4 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.config_options = options
         self.session_manager.save_session(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(config_options=self._reasoning_config_options(state))
